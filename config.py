@@ -4,16 +4,19 @@ Adjust these values to match your environment and preferences.
 """
 
 import os
+from datetime import date
 from pathlib import Path
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-BASE_DIR       = Path(__file__).parent
-DATA_DIR       = BASE_DIR / "data"           # Root folder for parquet files
-LOG_DIR        = BASE_DIR / "logs"           # Log files
-STATE_FILE     = BASE_DIR / ".last_run"      # Tracks last successful run date
+BASE_DIR          = Path(__file__).parent
+DATA_DIR          = BASE_DIR / "data"                    # Root for all data
+SYMBOLS_DATA_DIR  = DATA_DIR / "symbols"                 # One parquet per symbol
+LOG_DIR           = BASE_DIR / "logs"                    # Log files
+SYMBOL_STATE_FILE = BASE_DIR / ".symbol_state.json"      # Per-symbol last-fetch dates
 
 # ── NASDAQ Symbol Source ──────────────────────────────────────────────────────
-# NASDAQ publishes its listed-symbol directory as a pipe-delimited text file.
+# Used only when SYMBOLS is empty. NASDAQ publishes its listed-symbol directory
+# as a pipe-delimited text file.
 NASDAQ_SYMBOLS_URL = (
     "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 )

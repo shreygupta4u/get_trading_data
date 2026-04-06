@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''fetch_nasdaq_candles.py''\\).read\\(\\)\\); ast.parse\\(open\\(''view_data.py''\\).read\\(\\)\\); print\\(''Both OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''fetch_nasdaq_candles.py''\\).read\\(\\)\\); ast.parse\\(open\\(''config_symbols.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) or print\\(f, ''OK''\\) for f in [''fetch_nasdaq_candles.py'',''view_data.py'',''config.py'',''config_symbols.py'']]; print\\(''All syntax OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''fetch_nasdaq_candles.py''\\).read\\(\\)\\); print\\(''syntax OK''\\)\")",
+      "Bash(pip show:*)",
+      "Bash(pip install:*)",
+      "Bash(python -c \"from pytickersymbols import PyTickerSymbols; pts = PyTickerSymbols\\(\\); stocks = list\\(pts.get_stocks_by_index\\(''S&P 500''\\)\\); print\\(f''S&P 500: {len\\(stocks\\)} stocks''\\); print\\(''Sample:'', stocks[0]\\)\")",
+      "Bash(python -c \":*)"
+    ]
+  }
+}
