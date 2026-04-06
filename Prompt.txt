@@ -1,0 +1,105 @@
+FRESH-CHAT RECREATION PROMPT
+============================
+Copy everything below this line into a new Claude chat to recreate the
+NASDAQ Daily Candle Fetcher project exactly.
+────────────────────────────────────────────────────────────────────────────
+
+Please build a Python project called "NASDAQ Daily Candle Fetcher" with the
+following files and behaviour.  Output each file in full with no truncation.
+
+──────────────────────────────────────────────────────────────────
+PROJECT OVERVIEW
+──────────────────────────────────────────────────────────────────
+A Python tool that:
+1. Downloads the full list of NASDAQ-listed equities from the official NASDAQ
+   FTP symbol directory (pipe-delimited .txt file).
+2. Fetches the daily OHLCV candle for each symbol using yfinance's batch
+   download API.
+3. Stores the results locally as date-partitioned Parquet files
+   (Hive-style: data/year=YYYY/month=MM/YYYYMMDD.parquet).
+4. Runs on a recurring daily schedule at 4:15 PM local time via APScheduler.
+5. On every startup performs an automatic catch-up: back-fills up to 7
+   calendar days of missing trading-day data and, if past 4:15 PM and today's
+   file is missing, fetches immediately.
+
+──────────────────────────────────────────────────────────────────
+FILES TO PRODUCE
+──────────────────────────────────────────────────────────────────
+
+### config.py
+Central config constants (no CLI flags here):
+- BASE_DIR, DATA_DIR (./data), LOG_DIR (./logs), STATE_FILE (.last_run)
+- NASDAQ_SYMBOLS_URL = "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+- BATCH_SIZE = 100          # symbols per yfinance download call
+- BATCH_DELAY_SECONDS = 2   # pause between batches
+- MAX_WORKERS = 1
+- REQUEST_TIMEOUT = 30
+- RETRY_ATTEMPTS = 3
+- RETRY_DELAY_SECONDS = 10
+- SCHEDULE_HOUR = 16, SCHEDULE_MINUTE = 15
+- CATCHUP_DAYS = 7
+- PARQUET_COMPRESSION = "snappy"
+- COLUMNS_TO_KEEP = ["Open","High","Low","Close","Volume"]
+- LOG_LEVEL = "INFO", LOG_ROTATION_BYTES = 5 MB, LOG_BACKUP_COUNT = 5
+
+### fetch_nasdaq_candles.py
+Core fetching and storage logic with:
+- setup_logging() → RotatingFileHandler to logs/fetch.log + StreamHandler
+- fetch_nasdaq_symbols() → list[str]  — fetches, parses, and cleans the NASDAQ
+  symbol file; strips symbols containing $, ^, +, .
+- _fetch_batch(symbols, target_date) → pd.DataFrame  — calls yf.download with
+  group_by="ticker", auto_adjust=True; flattens MultiIndex to long format with
+  columns: symbol, date, Open, High, Low, Close, Volume
+- fetch_candles_for_date(symbols, target_date) → pd.DataFrame  — iterates
+  batches with retry logic; logs progress every 10 batches
+- parquet_path(target_date) → Path  — returns Hive-partitioned path
+- save_to_parquet(df, target_date) → Path  — writes parquet, casts date to
+  datetime, symbol to category
+- record_run(date) / last_run_date() → state file helpers
+- is_trading_day(date) → bool  — returns True Mon–Fri (no holiday check)
+- run_fetch(target_date, force=False) → bool  — orchestrates one day's fetch;
+  skips if file exists unless force=True; warns if run before 4 PM
+- run_today(force=False) → bool
+- CLI via argparse:
+    python fetch_nasdaq_candles.py                          # today
+    python fetch_nasdaq_candles.py --date YYYY-MM-DD        # one day
+    python fetch_nasdaq_candles.py --date START --date END  # inclusive range
+    python fetch_nasdaq_candles.py --force                  # overwrite existing
+
+### scheduler.py
+APScheduler (BlockingScheduler) wrapper with:
+- Own RotatingFileHandler to logs/scheduler.log
+- run_catchup() — finds missing trading days in the past CATCHUP_DAYS, fetches them
+- maybe_run_today() — if past schedule time and today's file missing, fetch now
+- scheduled_job() — called by the cron trigger
+- CronTrigger(hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE), max_instances=1,
+  coalesce=True, misfire_grace_time=3600
+- CLI flags: --catchup-only (run catch-up then exit), --run-now (fetch today then schedule)
+- Startup order: run_catchup() → maybe_run_today() → start scheduler
+
+### requirements.txt
+yfinance>=0.2.40
+pandas>=2.0.0
+pyarrow>=14.0.0
+requests>=2.31.0
+APScheduler>=3.10.4
+
+### README.md
+A comprehensive markdown README covering:
+- Project structure diagram
+- Quick start commands
+- How to read the parquet data (single day, full year, filtered by symbol with pyarrow.dataset)
+- Background service setup for Linux (systemd unit file), macOS (launchd plist),
+  and Windows (PowerShell Register-ScheduledTask with both Daily and AtStartup triggers)
+- Full configuration reference table
+- Notes on market holidays and data source
+
+──────────────────────────────────────────────────────────────────
+STYLE REQUIREMENTS
+──────────────────────────────────────────────────────────────────
+- Python 3.11+ syntax (use `list[str]`, `date | None` union types, etc.)
+- Every public function must have a docstring
+- Use f-strings throughout; no %-formatting except in logging calls
+- All magic numbers must live in config.py
+- Logging must go to both file (rotating) and stdout
+- No hardcoded paths; everything derives from BASE_DIR = Path(__file__).parent
