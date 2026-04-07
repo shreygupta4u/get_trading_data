@@ -41,9 +41,9 @@ import config
 from fetch_nasdaq_candles import (
     is_trading_day,
     load_symbol_state,
-    run_all_symbols,
     setup_logging,
 )
+from orchestrator import run_orchestrator
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 config.LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -112,7 +112,7 @@ def run_catchup() -> None:
         "Catch-up: fetching %d missed trading day(s)  (%s to %s)",
         len(missed), start, end,
     )
-    run_all_symbols(override_start=start, override_end=end)
+    run_orchestrator()   # orchestrator handles incremental logic for all periods
 
 
 def maybe_run_today() -> None:
@@ -135,10 +135,10 @@ def maybe_run_today() -> None:
 
     if now >= scheduled_time and not _has_data_for_date(today):
         log.info(
-            "Today (%s) data is missing and it is past %02d:%02d — fetching now.",
+            "Today (%s) data is missing and it is past %02d:%02d — running orchestrator now.",
             today, config.SCHEDULE_HOUR, config.SCHEDULE_MINUTE,
         )
-        run_all_symbols()
+        run_orchestrator()
 
 
 # ── Scheduled job ─────────────────────────────────────────────────────────────
@@ -146,7 +146,7 @@ def maybe_run_today() -> None:
 def scheduled_job() -> None:
     """Entry point called by APScheduler at the configured daily time."""
     log.info("=== Scheduled job triggered ===")
-    success = run_all_symbols()
+    success = run_orchestrator()
     if success:
         log.info("Scheduled job finished successfully.")
     else:

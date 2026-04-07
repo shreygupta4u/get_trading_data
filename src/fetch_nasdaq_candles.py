@@ -64,17 +64,19 @@ def setup_logging() -> logging.Logger:
         "%(asctime)s | %(levelname)-8s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    file_handler = RotatingFileHandler(
-        log_file, maxBytes=config.LOG_ROTATION_BYTES, backupCount=config.LOG_BACKUP_COUNT
-    )
-    file_handler.setFormatter(fmt)
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(fmt)
 
     logger = logging.getLogger("nasdaq_candles")
-    logger.setLevel(getattr(logging, config.LOG_LEVEL))
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+    # Guard: only add handlers once (safe when imported by orchestrator)
+    if not logger.handlers:
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=config.LOG_ROTATION_BYTES, backupCount=config.LOG_BACKUP_COUNT
+        )
+        file_handler.setFormatter(fmt)
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(fmt)
+        logger.setLevel(getattr(logging, config.LOG_LEVEL))
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
     return logger
 
 
@@ -361,24 +363,40 @@ def _fetch_nasdaq_symbols() -> list[str]:
 
 # ── Per-symbol state ──────────────────────────────────────────────────────────
 
-def load_symbol_state() -> dict[str, str]:
+def load_symbol_state(period: str = "daily") -> dict[str, str]:
     """
-    Load per-symbol last-fetch dates from the JSON state file.
+    Load per-symbol last-fetch dates from the JSON state file for *period*.
     Returns a dict like {"AAPL": "2026-04-04", "MSFT": "2026-04-04"}.
     """
-    if config.SYMBOL_STATE_FILE.exists():
+    path = config.SYMBOL_STATE_FILES.get(period, config.SYMBOL_STATE_FILE)
+    if path.exists():
         try:
-            return json.loads(config.SYMBOL_STATE_FILE.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
-            log.warning("Could not read state file (%s) — starting fresh.", exc)
+            log.warning("Could not read state file %s (%s) — starting fresh.", path, exc)
     return {}
 
 
-def save_symbol_state(state: dict[str, str]) -> None:
+def save_symbol_state(state: dict[str, str], period: str = "daily") -> None:
     """Persist the state dict to disk (sorted for readability)."""
-    config.SYMBOL_STATE_FILE.write_text(
-        json.dumps(state, indent=2, sort_keys=True), encoding="utf-8"
-    )
+    path = config.SYMBOL_STATE_FILES.get(period, config.SYMBOL_STATE_FILE)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+
+
+# ── Week helpers ──────────────────────────────────────────────────────────────
+
+def _this_week_start() -> date:
+    """Monday of the current ISO week."""
+    today = date.today()
+    return today - timedelta(days=today.weekday())
+
+
+def _last_complete_week_start() -> date:
+    """
+    Monday of the last *fully completed* ISO week (ended last Sunday).
+    If today is Wednesday 2026-04-08, returns Monday 2026-03-30.
+    """
+    return _this_week_start() - timedelta(weeks=1)
 
 
 # ── Raw data normalisation ────────────────────────────────────────────────────
@@ -559,15 +577,71 @@ def _save_parquet_fallback(df: pd.DataFrame) -> None:
         log.info("  Parquet saved: %s — %d rows", path.name, len(group))
 
 
-def save_symbol_data(df: pd.DataFrame, _symbol: str = "") -> None:
+def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Persist candle rows to the Delta candles table (data/delta/candles/).
+    Compute SMA-20, SMA-33, EMA-20, EMA-33 on the Close column of a
+    single-symbol DataFrame that is already sorted by date.
 
-    Uses the `deltalake` package — no Java required.
-    Per-symbol Parquet files in data/symbols/ are kept as a legacy backup
-    but are no longer the primary store.
+    Called inline inside the parallel fetch worker so indicators are
+    computed immediately after candle data arrives, not in a separate pass.
+
+    Rolling windows require sufficient history:
+      - For new symbols (first fetch = full IPO history): all windows compute.
+      - For incremental fetches: we read the FULL existing history first,
+        append the new rows, recompute on the combined series, then return
+        only the new rows with fresh indicator values. This ensures the
+        rolling window always has enough context even on small incremental
+        fetches (e.g. 1-day update).
     """
-    delta_utils.upsert_candles(df)
+    if df.empty:
+        return df
+
+    symbol = df["symbol"].iloc[0]
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+
+    # Read existing history from Delta so rolling window has full context
+    existing = delta_utils.read_candles(symbols=[symbol], period="daily")
+    if not existing.empty:
+        existing["date"] = pd.to_datetime(existing["date"])
+        # Combine: existing base + new rows (new rows take precedence on same date)
+        combined = pd.concat([existing, df], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["date"], keep="last")
+        combined = combined.sort_values("date").reset_index(drop=True)
+    else:
+        combined = df
+
+    close = combined["Close"]
+    combined["sma_20"] = close.rolling(window=20, min_periods=20).mean().round(6)
+    combined["sma_33"] = close.rolling(window=33, min_periods=33).mean().round(6)
+    combined["ema_20"] = close.ewm(span=20, adjust=False, min_periods=20).mean().round(6)
+    combined["ema_33"] = close.ewm(span=33, adjust=False, min_periods=33).mean().round(6)
+
+    # Return only the new rows (with their freshly computed indicators)
+    new_dates = set(df["date"])
+    result = combined[combined["date"].isin(new_dates)].reset_index(drop=True)
+    return result
+
+
+_INDICATOR_COLS = {"sma_20", "sma_33", "ema_20", "ema_33"}
+
+def save_symbol_data(df: pd.DataFrame, period: str = "daily") -> None:
+    """
+    Persist candle rows to the Delta table for *period*.
+
+    - If the DataFrame contains indicator columns (sma_20/33, ema_20/33):
+      uses update-mode merge so existing rows get their indicator values
+      filled in and new rows are inserted with indicators already set.
+
+    - If no indicator columns are present:
+      uses insert-only merge (new rows only, existing rows untouched).
+    """
+    has_indicators = bool(_INDICATOR_COLS & set(df.columns))
+    if has_indicators:
+        delta_utils.upsert_technicals(df, period=period)
+    else:
+        delta_utils.upsert_candles(df, period=period)
 
 
 # ── Date helpers ──────────────────────────────────────────────────────────────
@@ -598,27 +672,25 @@ def _safe_end_date(requested: date) -> date:
 # ── Main fetch engine ─────────────────────────────────────────────────────────
 
 def run_all_symbols(
+    period: str = "daily",
     force: bool = False,
     override_start: date | None = None,
     override_end: date | None = None,
 ) -> bool:
     """
-    Core loop — iterates over every configured symbol and fetches / updates it.
+    Fetch / derive candles for all configured symbols for the given *period*.
 
-    Per-symbol logic
-    ----------------
-    New symbol (not in .symbol_state.json)
-        → fetches full history from IPO via period='max'
-    Known symbol
-        → incremental fetch: last_saved_date + 1 day  →  end_date
-    override_start / override_end
-        → bypasses state; forces a specific date range for all symbols
+    period="daily"
+        Fetches raw OHLCV from yfinance (parallel, incremental).
+        Skips symbols already up to the safe end date.
 
-    After each symbol, the state file is updated immediately so that a
-    partial run can be resumed later without re-downloading already-saved data.
+    period="weekly"
+        Derives weekly OHLCV by resampling the daily Delta table.
+        Skips symbols whose weekly state >= last complete week Monday.
+        No yfinance calls — pure resample of existing data.
+
+    Returns True if at least one symbol was written successfully.
     """
-    end = _safe_end_date(override_end or date.today())
-
     try:
         symbols = get_symbols()
     except Exception:
@@ -628,22 +700,42 @@ def run_all_symbols(
         log.error("Symbol list is empty — nothing to do.")
         return False
 
-    # ── One-time migration of legacy Parquet files to Delta ──────────────────
-    delta_utils.migrate_parquet_to_delta()
+    # One-time migrations: legacy Parquet files → Delta, then separate
+    # candle/technicals tables → combined daily/weekly tables
+    if period == "daily":
+        delta_utils.migrate_parquet_to_delta()
+    delta_utils.migrate_to_combined_tables()
 
-    state      = load_symbol_state()
-    state_lock = threading.Lock()
-    total      = len(symbols)
-    skipped    = 0
-    failed     = 0
+    if period == "weekly":
+        return _run_all_weekly(symbols, force=force)
+    else:
+        return _run_all_daily(
+            symbols,
+            force=force,
+            override_start=override_start,
+            override_end=override_end,
+        )
+
+
+# ── Daily fetch (yfinance, parallel) ─────────────────────────────────────────
+
+def _run_all_daily(
+    symbols: list[str],
+    force: bool = False,
+    override_start: date | None = None,
+    override_end: date | None = None,
+) -> bool:
+    end   = _safe_end_date(override_end or date.today())
+    state = load_symbol_state("daily")
+    state_lock  = threading.Lock()
+    total       = len(symbols)
+    skipped = failed = 0
     any_success = False
 
-    log.info("Parallel fetch: %d symbol(s), %d workers, end=%s",
+    log.info("[daily] Parallel fetch: %d symbol(s), %d workers, end=%s",
              total, config.MAX_WORKERS, end)
-    log.info("State file: %s  (%d symbols already tracked)",
-             config.SYMBOL_STATE_FILE, len(state))
 
-    # ── Build the work list ───────────────────────────────────────────────────
+    # ── Build work list ───────────────────────────────────────────────────────
     pending: list[tuple[str, date]] = []
     for symbol in symbols:
         if override_start is not None:
@@ -658,81 +750,223 @@ def run_all_symbols(
             else:
                 pending.append((symbol, nxt))
 
-    log.info("%d symbol(s) to fetch, %d already up to date", len(pending), skipped)
+    log.info("[daily] %d to fetch, %d already up to date", len(pending), skipped)
 
-    # ── Worker function (runs in each thread) ─────────────────────────────────
     def _fetch_one(sym: str, start: date) -> tuple[str, pd.DataFrame | None, date | None]:
-        reason = "full history" if start <= _FULL_HISTORY_SENTINEL else f"{start} → {end}"
-        log.info("  [fetch] %s  (%s)", sym, reason)
+        reason = "full history" if start <= _FULL_HISTORY_SENTINEL else f"{start} to {end}"
+        log.info("  [daily] %s  (%s)", sym, reason)
         try:
             df = fetch_symbol(sym, start, end)
             if df.empty:
                 return sym, None, None
+            # Compute indicators inline — uses full history from Delta for context
+            df = _add_indicators(df)
             latest = pd.to_datetime(df["date"]).dt.date.max()
             return sym, df, latest
         except Exception as exc:
-            log.error("  [error] %s: %s", sym, exc)
+            log.error("  [daily error] %s: %s", sym, exc)
             return sym, None, None
 
-    # ── Process in parallel batches of MAX_WORKERS ───────────────────────────
-    batch_size   = config.MAX_WORKERS
+    batch_size    = config.MAX_WORKERS
     total_batches = max(1, (len(pending) + batch_size - 1) // batch_size)
 
     try:
         for b_idx, b_start in enumerate(range(0, len(pending), batch_size), start=1):
             batch = pending[b_start : b_start + batch_size]
             pct   = (b_start / max(len(pending), 1)) * 100
-
-            log.info("=== Batch %d/%d  (%.0f%%)  symbols: %s ===",
+            log.info("=== [daily] Batch %d/%d  (%.0f%%)  %s ===",
                      b_idx, total_batches, pct, [s for s, _ in batch])
 
-            # Fetch all symbols in this batch concurrently
             with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
-                futures = {
-                    executor.submit(_fetch_one, sym, start): sym
-                    for sym, start in batch
-                }
+                futures = {executor.submit(_fetch_one, sym, start): sym
+                           for sym, start in batch}
                 batch_results: list[tuple[str, pd.DataFrame, date]] = []
                 for future in as_completed(futures):
                     sym, df, latest = future.result()
                     if df is not None:
                         batch_results.append((sym, df, latest))
-                        log.info("  [done] %s  rows=%d  last=%s", sym, len(df), latest)
+                        log.info("  [daily done] %s  rows=%d  last=%s", sym, len(df), latest)
                     else:
                         failed += 1
 
-            # Write entire batch to Delta in one Spark operation
             if batch_results:
-                combined = pd.concat(
-                    [r[1] for r in batch_results], ignore_index=True
-                )
-                save_symbol_data(combined)
-
-                # Update state for all symbols that succeeded
+                combined = pd.concat([r[1] for r in batch_results], ignore_index=True)
+                save_symbol_data(combined, period="daily")
                 with state_lock:
                     for sym, _, latest in batch_results:
                         state[sym] = latest.isoformat()
-                    save_symbol_state(state)
-
+                    save_symbol_state(state, "daily")
                 any_success = True
-                log.info("  Batch %d/%d saved: %d symbol(s), %d rows total",
+                log.info("  [daily] Batch %d/%d saved: %d symbol(s), %d rows",
                          b_idx, total_batches, len(batch_results), len(combined))
 
-            # Politeness pause between batches
             if b_idx < total_batches:
                 time.sleep(config.BATCH_DELAY_SECONDS)
 
     except KeyboardInterrupt:
-        log.warning(
-            "Interrupted — state already saved up to the last completed batch. "
-            "Re-run to continue."
-        )
+        log.warning("[daily] Interrupted — state saved to last completed batch.")
 
     done = sum(1 for s in symbols if s in state)
-    log.info(
-        "Run complete: %d/%d in state  |  skipped=%d  failed=%d",
-        done, total, skipped, failed,
-    )
+    log.info("[daily] Done: %d/%d in state | skipped=%d failed=%d",
+             done, total, skipped, failed)
+    return any_success
+
+
+# ── Weekly fetch (resample from daily Delta, no yfinance) ────────────────────
+
+def _run_all_weekly(symbols: list[str], force: bool = False) -> bool:
+    """
+    Derive weekly OHLCV candles by resampling the daily Delta table.
+
+    Skip logic (per symbol)
+    -----------------------
+    weekly_state[symbol] >= last_complete_week_start()
+        → already have all complete weeks → skip
+
+    Only COMPLETE weeks (week_start < this Monday) are written.
+    The current in-progress week is intentionally excluded so it can be
+    re-derived on the next run once more daily bars arrive.
+    """
+    if not delta_utils.is_delta_table(delta_utils.CANDLES_DELTA_PATH):
+        log.error("[weekly] Daily Delta table not found — run daily fetch first.")
+        return False
+
+    daily_state  = load_symbol_state("daily")
+    weekly_state = load_symbol_state("weekly")
+
+    last_complete = _last_complete_week_start()   # last Monday whose week is done
+    this_monday   = _this_week_start()            # current week start — excluded
+
+    total   = len(symbols)
+    skipped = failed = 0
+    any_success = False
+
+    # ── Determine which symbols need updating ─────────────────────────────────
+    pending: list[str] = []
+    for symbol in symbols:
+        if symbol not in daily_state:
+            log.debug("  [weekly] %s: no daily data yet — skipping", symbol)
+            skipped += 1
+            continue
+        if not force and symbol in weekly_state:
+            last_w = date.fromisoformat(weekly_state[symbol])
+            if last_w >= last_complete:
+                skipped += 1
+                continue
+        pending.append(symbol)
+
+    log.info("[weekly] %d symbol(s) to derive, %d already up to date (last complete week: %s)",
+             len(pending), skipped, last_complete)
+
+    if not pending:
+        return True
+
+    # ── Batch-read daily candles for all pending symbols ──────────────────────
+    # Read from earliest weekly state date - 1 week to catch any late arrivals
+    min_weekly_date = None
+    for sym in pending:
+        if sym in weekly_state:
+            d = date.fromisoformat(weekly_state[sym])
+            if min_weekly_date is None or d < min_weekly_date:
+                min_weekly_date = d
+
+    read_from = str(min_weekly_date - timedelta(days=7)) if min_weekly_date else None
+
+    log.info("[weekly] Reading daily candles from Delta (from %s)...",
+             read_from or "beginning of history")
+    daily_df = delta_utils.read_candles(symbols=pending, start=read_from, period="daily")
+
+    if daily_df.empty:
+        log.error("[weekly] No daily candles returned for pending symbols.")
+        return False
+
+    daily_df["date"] = pd.to_datetime(daily_df["date"])
+
+    # ── Resample each symbol to weekly ───────────────────────────────────────
+    results: list[pd.DataFrame] = []
+
+    for symbol, grp in daily_df.groupby("symbol"):
+        try:
+            grp = grp.sort_values("date").set_index("date")
+
+            # Snap each daily bar to its ISO week Monday
+            grp["week_start"] = (
+                grp.index - pd.to_timedelta(grp.index.dayofweek, unit="D")
+            ).date
+
+            # Only keep rows in COMPLETE weeks (week_start < this Monday)
+            grp = grp[grp["week_start"] < this_monday]
+
+            if symbol in weekly_state and not force:
+                last_w = date.fromisoformat(weekly_state[symbol])
+                grp = grp[grp["week_start"] > last_w]
+
+            if grp.empty:
+                continue
+
+            weekly_grp = (
+                grp.groupby("week_start")
+                .agg(
+                    Open        =("Open",  "first"),
+                    High        =("High",  "max"),
+                    Low         =("Low",   "min"),
+                    Close       =("Close", "last"),
+                    Volume      =("Volume","sum"),
+                    trading_days=("Close", "count"),
+                )
+            )
+            weekly_grp["symbol"]  = symbol
+            weekly_grp.index.name = "week_start"
+            weekly_grp = weekly_grp.reset_index()
+
+            # ── Indicators on weekly Close ────────────────────────────────────
+            # Combine with existing weekly history so rolling window has context
+            existing_w = delta_utils.read_candles(symbols=[symbol], period="weekly")
+            if not existing_w.empty:
+                existing_w["week_start"] = pd.to_datetime(existing_w["week_start"])
+                weekly_grp["week_start"] = pd.to_datetime(weekly_grp["week_start"])
+                combined_w = pd.concat([existing_w, weekly_grp], ignore_index=True)
+                combined_w = combined_w.drop_duplicates(subset=["week_start"], keep="last")
+                combined_w = combined_w.sort_values("week_start").reset_index(drop=True)
+            else:
+                weekly_grp["week_start"] = pd.to_datetime(weekly_grp["week_start"])
+                combined_w = weekly_grp.sort_values("week_start").reset_index(drop=True)
+
+            close_w = combined_w["Close"]
+            combined_w["sma_20"] = close_w.rolling(window=20, min_periods=20).mean().round(6)
+            combined_w["sma_33"] = close_w.rolling(window=33, min_periods=33).mean().round(6)
+            combined_w["ema_20"] = close_w.ewm(span=20, adjust=False, min_periods=20).mean().round(6)
+            combined_w["ema_33"] = close_w.ewm(span=33, adjust=False, min_periods=33).mean().round(6)
+
+            # Keep only newly derived weeks
+            new_weeks = set(weekly_grp["week_start"])
+            weekly_grp = combined_w[combined_w["week_start"].isin(new_weeks)].reset_index(drop=True)
+            results.append(weekly_grp)
+
+        except Exception as exc:
+            log.error("  [weekly error] %s: %s", symbol, exc)
+            failed += 1
+
+    if not results:
+        log.info("[weekly] No new weekly candles to write.")
+        return True
+
+    combined = pd.concat(results, ignore_index=True)
+    save_symbol_data(combined, period="weekly")
+
+    # Update weekly state to last_complete for each symbol written
+    for r in results:
+        sym        = r["symbol"].iloc[0]
+        latest_wk  = r["week_start"].max()
+        # Store the actual latest week written (not the sentinel)
+        weekly_state[sym] = str(latest_wk) if isinstance(latest_wk, date) \
+                            else pd.to_datetime(latest_wk).date().isoformat()
+
+    save_symbol_state(weekly_state, "weekly")
+    any_success = True
+
+    log.info("[weekly] Done: %d symbol(s) written, %d rows, %d failed",
+             len(results), len(combined), failed)
     return any_success
 
 
@@ -740,16 +974,23 @@ def run_all_symbols(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fetch daily OHLCV candles per symbol and store as Parquet.",
+        description="Fetch OHLCV candles per symbol and store in Delta Lake.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples
 --------
-  python fetch_nasdaq_candles.py                          # incremental update
-  python fetch_nasdaq_candles.py --force                  # re-fetch all from IPO
-  python fetch_nasdaq_candles.py --date 2025-01-01        # incremental up to date
+  python fetch_nasdaq_candles.py                                # daily incremental
+  python fetch_nasdaq_candles.py --period weekly                # derive weekly candles
+  python fetch_nasdaq_candles.py --force                        # re-fetch all from IPO
+  python fetch_nasdaq_candles.py --date 2025-01-01              # daily up to date
   python fetch_nasdaq_candles.py --date 2024-01-01 --date 2025-01-01  # fixed range
         """,
+    )
+    parser.add_argument(
+        "--period",
+        choices=["daily", "weekly"],
+        default="daily",
+        help="Time period to fetch/derive (default: daily).",
     )
     parser.add_argument(
         "--date",
@@ -758,13 +999,14 @@ Examples
         metavar="YYYY-MM-DD",
         help=(
             "Pass once to set an explicit end date. "
-            "Pass twice (start then end) to override both bounds for all symbols."
+            "Pass twice (start then end) to override both bounds. "
+            "Only applies to --period daily."
         ),
     )
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Ignore saved state and re-fetch all symbols from their IPO date.",
+        help="Ignore saved state and re-fetch/re-derive all symbols from scratch.",
     )
     return parser.parse_args()
 
@@ -776,19 +1018,22 @@ def main() -> None:
     override_end: date | None = None
 
     if args.dates:
-        if len(args.dates) == 1:
+        if args.period == "weekly":
+            log.warning("--date is ignored for --period weekly.")
+        elif len(args.dates) == 1:
             override_end = _safe_end_date(date.fromisoformat(args.dates[0]))
         elif len(args.dates) == 2:
             override_start = date.fromisoformat(args.dates[0])
             override_end   = _safe_end_date(date.fromisoformat(args.dates[1]))
             if override_start > override_end:
-                log.error("Start date %s must be ≤ end date %s.", override_start, override_end)
+                log.error("Start date %s must be <= end date %s.", override_start, override_end)
                 sys.exit(1)
         else:
             log.error("Pass at most two --date arguments (start end).")
             sys.exit(1)
 
     success = run_all_symbols(
+        period=args.period,
         force=args.force,
         override_start=override_start,
         override_end=override_end,

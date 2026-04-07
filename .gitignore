@@ -9,3 +9,5 @@ trading_data.xlsx
 .symbol_state.json
 *.pyc
 /logs
+*.pyc
+*.pyc
