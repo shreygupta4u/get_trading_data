@@ -25,21 +25,35 @@ Supported index short names  (resolved via pytickersymbols, Wikipedia as fallbac
         "MDAX"       — MDAX (Germany)      (  50 stocks)
         "TECDAX"     — TecDAX (Germany)    (  30 stocks)
 
-Example
--------
-    SYMBOLS = ["AAPL", "TSLA"]
-    INDEXES = ["SP500", "NASDAQ100"]
-    → fetches AAPL + TSLA + all S&P 500 + NASDAQ 100 stocks (de-duplicated)
+Special values
+--------------
+    SYMBOLS = ["all"]   — download every ticker listed on NASDAQ
+                          (ignores INDEXES entirely)
+    INDEXES = ["none"]  — skip all index expansion
+                          (only the tickers in SYMBOLS are fetched)
 
-Leave both lists empty to fall back to the full NASDAQ listed-symbol directory.
+Examples
+--------
+    SYMBOLS = ["AAPL", "TSLA"],  INDEXES = ["SP500", "NASDAQ100"]
+    → AAPL + TSLA + all S&P 500 + NASDAQ 100 stocks (de-duplicated)
+
+    SYMBOLS = ["all"],  INDEXES = [...]
+    → every NASDAQ-listed ticker (INDEXES is ignored)
+
+    SYMBOLS = ["AAPL", "MSFT"],  INDEXES = ["none"]
+    → only AAPL and MSFT
+
+    SYMBOLS = [],  INDEXES = []
+    → falls back to the full NASDAQ listed-symbol directory (same as "all")
 """
 
 # ── Individual Symbols ────────────────────────────────────────────────────────
+# Use ["all"] to download every NASDAQ-listed ticker.
 SYMBOLS: list[str] = [
-    "AAPL",   # Apple
-    "MSFT",   # Microsoft
-    "CRWD",     # Crowdstrike
-    "GOOGL",  # Alphabet
+    #"AAPL",   # Apple
+    #"MSFT",   # Microsoft
+    #"CRWD",   # Crowdstrike
+    #"GOOGL",  # Alphabet
     # "AMZN",   # Amazon
     # "NVDA",   # NVIDIA
     # "META",   # Meta
@@ -47,10 +61,9 @@ SYMBOLS: list[str] = [
 ]
 
 # ── Index Constituents ────────────────────────────────────────────────────────
-# Add index names here to include all their constituent stocks.
-# Constituents are fetched live from Wikipedia at run time.
+# Use ["none"] to skip all index expansion.
 INDEXES: list[str] = [
-    "SP500",
+    #"SP500",
     # "NASDAQ100",
     # "DOW30",
 ]

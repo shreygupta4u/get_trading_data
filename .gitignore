@@ -1,2 +1,3 @@
 *.parquet
 trading_data.xlsx
+/__pycache__

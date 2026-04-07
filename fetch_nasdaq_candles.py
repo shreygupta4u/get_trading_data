@@ -217,10 +217,28 @@ def _fetch_index_constituents(index_name: str) -> list[str]:
 
 def get_symbols() -> list[str]:
     """
-    Build the final symbol list from config_symbols.SYMBOLS + any INDEXES.
-    De-duplicates while preserving order (explicit symbols come first).
-    Falls back to the full NASDAQ directory if both lists are empty.
+    Build the final symbol list.
+
+    Special values
+    --------------
+    SYMBOLS = ["all"]   → return the full NASDAQ listed-symbol directory
+                          (INDEXES is ignored)
+    INDEXES = ["none"]  → skip all index expansion (only SYMBOLS are used)
+
+    Normal behaviour
+    ----------------
+    Start with explicit SYMBOLS, merge each index's constituents, de-duplicate
+    (preserving order, explicit symbols first).
+    If both lists are empty, fall back to the full NASDAQ directory.
     """
+    symbols_cfg = [s.strip() for s in config_symbols.SYMBOLS if s.strip()]
+    indexes_cfg = [i.strip() for i in config_symbols.INDEXES if i.strip()]
+
+    # "all" in SYMBOLS → download every NASDAQ ticker, ignore everything else
+    if any(s.upper() == "ALL" for s in symbols_cfg):
+        log.info('SYMBOLS contains "all" — fetching full NASDAQ symbol list.')
+        return _fetch_nasdaq_symbols()
+
     seen: set[str] = set()
     result: list[str] = []
 
@@ -230,48 +248,112 @@ def get_symbols() -> list[str]:
             seen.add(s)
             result.append(s)
 
-    for s in config_symbols.SYMBOLS:
+    for s in symbols_cfg:
         _add(s)
 
-    for index_name in config_symbols.INDEXES:
-        for s in _fetch_index_constituents(index_name):
-            _add(s)
+    # "none" in INDEXES → skip index expansion entirely
+    if not any(i.upper() == "NONE" for i in indexes_cfg):
+        for index_name in indexes_cfg:
+            for s in _fetch_index_constituents(index_name):
+                _add(s)
 
     if result:
         log.info(
-            "Symbol list: %d explicit symbol(s) + index constituents = %d total",
-            len(config_symbols.SYMBOLS), len(result),
+            "Symbol list: %d explicit + index constituents = %d total",
+            len(symbols_cfg), len(result),
         )
         return result
 
+    # Both lists empty → fall back to full NASDAQ directory
     return _fetch_nasdaq_symbols()
 
 
-def _fetch_nasdaq_symbols() -> list[str]:
-    """Download full NASDAQ listed-symbol directory (fallback when SYMBOLS=[] and INDEXES=[])."""
-    log.info("Fetching NASDAQ symbol list from %s", config.NASDAQ_SYMBOLS_URL)
+_SCREENER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nasdaq.com/",
+}
+
+_SYMBOL_JUNK_CHARS = frozenset("$^+.")
+
+
+def _is_clean_symbol(sym: str) -> bool:
+    return bool(sym) and not any(c in sym for c in _SYMBOL_JUNK_CHARS)
+
+
+def _fetch_nasdaq_symbols_screener() -> list[str]:
+    """
+    Primary source: NASDAQ Screener JSON API.
+    Returns all US-listed tickers visible in the NASDAQ stock screener.
+    """
+    log.info("Fetching symbol list from NASDAQ Screener API...")
+    try:
+        resp = requests.get(
+            config.NASDAQ_SCREENER_URL, headers=_SCREENER_HEADERS, timeout=30
+        )
+        resp.raise_for_status()
+        rows = resp.json().get("data", {}).get("rows") or []
+        symbols = [
+            r["symbol"].strip()
+            for r in rows
+            if r.get("symbol") and _is_clean_symbol(r["symbol"].strip())
+        ]
+        if symbols:
+            log.info("NASDAQ Screener API: %d symbols", len(symbols))
+        return symbols
+    except Exception as exc:
+        log.warning("NASDAQ Screener API failed: %s", exc)
+        return []
+
+
+def _fetch_nasdaq_symbols_ftp() -> list[str]:
+    """
+    Fallback source: NASDAQ FTP pipe-delimited listed-symbol file.
+    """
+    log.info("Fetching symbol list from NASDAQ FTP file...")
     try:
         resp = requests.get(config.NASDAQ_SYMBOLS_URL, timeout=30)
         resp.raise_for_status()
-    except requests.RequestException as exc:
-        log.error("Could not fetch symbol list: %s", exc)
-        raise
+        lines = resp.text.splitlines()
+        data_lines = [l for l in lines[1:] if not l.startswith("File Creation Time")]
+        symbols = []
+        for line in data_lines:
+            parts = line.split("|")
+            if len(parts) < 2:
+                continue
+            sym = parts[0].strip()
+            if _is_clean_symbol(sym):
+                symbols.append(sym)
+        if symbols:
+            log.info("NASDAQ FTP: %d symbols", len(symbols))
+        return symbols
+    except Exception as exc:
+        log.warning("NASDAQ FTP failed: %s", exc)
+        return []
 
-    lines = resp.text.splitlines()
-    data_lines = [l for l in lines[1:] if not l.startswith("File Creation Time")]
-    symbols = []
-    for line in data_lines:
-        parts = line.split("|")
-        if len(parts) < 2:
-            continue
-        symbol = parts[0].strip()
-        if any(c in symbol for c in ("$", "^", "+", ".")):
-            continue
-        if symbol:
-            symbols.append(symbol)
 
-    log.info("Found %d NASDAQ symbols", len(symbols))
-    return symbols
+def _fetch_nasdaq_symbols() -> list[str]:
+    """
+    Fetch all NASDAQ-listed symbols, trying sources in order:
+      1. NASDAQ Screener JSON API  (primary — works from most networks)
+      2. NASDAQ FTP pipe-delimited file  (fallback)
+    Raises RuntimeError if every source fails.
+    """
+    for fetcher in (_fetch_nasdaq_symbols_screener, _fetch_nasdaq_symbols_ftp):
+        symbols = fetcher()
+        if symbols:
+            return symbols
+
+    raise RuntimeError(
+        "Could not fetch the NASDAQ symbol list from any source. "
+        "Check your internet connection, or explicitly set SYMBOLS / INDEXES "
+        "in config_symbols.py to avoid needing the NASDAQ directory."
+    )
 
 
 # ── Per-symbol state ──────────────────────────────────────────────────────────
@@ -547,54 +629,80 @@ def run_all_symbols(
     state = load_symbol_state()
     any_success = False
     total = len(symbols)
+    skipped = 0
+    failed = 0
 
     log.info("Starting fetch for %d symbol(s)  end_date=%s", total, end)
+    log.info("State file: %s  (%d symbols already tracked)", config.SYMBOL_STATE_FILE, len(state))
 
-    for idx, symbol in enumerate(symbols, start=1):
-        log.info("─── [%d/%d] %s ───", idx, total, symbol)
+    try:
+        for idx, symbol in enumerate(symbols, start=1):
 
-        # ── Determine start date for this symbol ──────────────────────────────
-        if override_start is not None:
-            start = override_start
-            log.info("  Range override: %s → %s", start, end)
+            # ── Checkpoint log every 50 symbols ──────────────────────────────
+            if idx > 1 and (idx - 1) % 50 == 0:
+                pct = (idx - 1) / total * 100
+                log.info(
+                    "=== Checkpoint: %d/%d (%.0f%%)  saved=%d  skipped=%d  failed=%d ===",
+                    idx - 1, total, pct, any_success and 1 or 0, skipped, failed,
+                )
 
-        elif force or symbol not in state:
-            # First time or forced re-fetch → full history from IPO
-            start = date(1900, 1, 1)   # sentinel triggers period='max' fetch
-            reason = "forced re-fetch" if (force and symbol in state) else "new symbol"
-            log.info("  %s — fetching full history from IPO → %s", reason, end)
+            log.info("--- [%d/%d] %s ---", idx, total, symbol)
 
-        else:
-            last_fetched = date.fromisoformat(state[symbol])
-            start = last_fetched + timedelta(days=1)
-            if start > end:
-                log.info("  Already up to date (last candle: %s) — skipping.", last_fetched)
+            # ── Determine start date for this symbol ──────────────────────────
+            if override_start is not None:
+                start = override_start
+                log.info("  Range override: %s to %s", start, end)
+
+            elif force or symbol not in state:
+                start = date(1900, 1, 1)   # sentinel → period='max' fetch
+                reason = "forced re-fetch" if (force and symbol in state) else "new symbol"
+                log.info("  %s — fetching full history from IPO to %s", reason, end)
+
+            else:
+                last_fetched = date.fromisoformat(state[symbol])
+                start = last_fetched + timedelta(days=1)
+                if start > end:
+                    log.info("  Already up to date (last candle: %s) — skipping.", last_fetched)
+                    skipped += 1
+                    continue
+                log.info("  Incremental: %s to %s (last: %s)", start, end, last_fetched)
+
+            # ── Fetch ─────────────────────────────────────────────────────────
+            df = fetch_symbol(symbol, start, end)
+
+            if df.empty:
+                log.warning("  No data returned for %s — state unchanged.", symbol)
+                failed += 1
+                if idx < total:
+                    time.sleep(config.BATCH_DELAY_SECONDS)
                 continue
-            log.info("  Incremental: last candle %s → fetching %s → %s", last_fetched, start, end)
 
-        # ── Fetch ─────────────────────────────────────────────────────────────
-        df = fetch_symbol(symbol, start, end)
+            # ── Save & update state immediately after each symbol ─────────────
+            save_symbol_data(df, symbol)
 
-        if df.empty:
-            log.warning("  No data returned for %s — state unchanged.", symbol)
+            latest_date = pd.to_datetime(df["date"]).dt.date.max()
+            state[symbol] = latest_date.isoformat()
+            save_symbol_state(state)          # written to disk after every symbol
+            any_success = True
+
+            log.info("  Saved: %s  last_candle=%s", symbol, latest_date)
+
             if idx < total:
                 time.sleep(config.BATCH_DELAY_SECONDS)
-            continue
 
-        # ── Save & update state immediately ───────────────────────────────────
-        save_symbol_data(df, symbol)
+    except KeyboardInterrupt:
+        # State was already saved after the last completed symbol — nothing lost.
+        log.warning(
+            "Interrupted by user after %d/%d symbols. "
+            "Re-run to continue from where it left off.",
+            idx, total,
+        )
 
-        latest_date = pd.to_datetime(df["date"]).dt.date.max()
-        state[symbol] = latest_date.isoformat()
-        save_symbol_state(state)
-        any_success = True
-
-        log.info("  State updated: %s last_candle=%s", symbol, latest_date)
-
-        if idx < total:
-            time.sleep(config.BATCH_DELAY_SECONDS)
-
-    log.info("Fetch complete — %d/%d symbols had new data.", sum(1 for s in symbols if s in state), total)
+    done = sum(1 for s in symbols if s in state)
+    log.info(
+        "Run complete: %d/%d symbols in state  |  skipped=%d  failed=%d",
+        done, total, skipped, failed,
+    )
     return any_success
 
 
