@@ -11,3 +11,4 @@ trading_data.xlsx
 /logs
 *.pyc
 *.pyc
+/__pycache__
