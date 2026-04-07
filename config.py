@@ -10,7 +10,8 @@ from pathlib import Path
 # ── Paths ────────────────────────────────────────────────────────────────────
 BASE_DIR          = Path(__file__).parent
 DATA_DIR          = BASE_DIR / "data"                    # Root for all data
-SYMBOLS_DATA_DIR  = DATA_DIR / "symbols"                 # One parquet per symbol
+SYMBOLS_DATA_DIR  = DATA_DIR / "symbols"                 # Legacy per-symbol parquet (kept, not deleted)
+DELTA_DIR         = DATA_DIR / "delta"                   # Delta Lake tables (primary store)
 LOG_DIR           = BASE_DIR / "logs"                    # Log files
 SYMBOL_STATE_FILE = BASE_DIR / ".symbol_state.json"      # Per-symbol last-fetch dates
 
@@ -25,12 +26,13 @@ NASDAQ_SYMBOLS_URL = (                                        # FTP fallback
 )
 
 # ── Fetch Settings ────────────────────────────────────────────────────────────
-BATCH_SIZE          = 100      # Symbols to request per yfinance batch call
-BATCH_DELAY_SECONDS = 2        # Pause between batches (be polite to the API)
-MAX_WORKERS         = 1        # Parallel batch workers (keep at 1 to avoid bans)
-REQUEST_TIMEOUT     = 30       # yfinance download timeout in seconds
-RETRY_ATTEMPTS      = 3        # Retry failed batches this many times
-RETRY_DELAY_SECONDS = 10       # Wait between retries
+BATCH_SIZE           = 100     # (legacy) symbols per yfinance batch call
+BATCH_DELAY_SECONDS  = 2      # Pause between parallel batches (politeness delay)
+MAX_WORKERS          = 4      # Parallel yfinance fetch threads per batch
+                               # Increase for faster downloads; lower if rate-limited
+REQUEST_TIMEOUT      = 30     # yfinance download timeout in seconds
+RETRY_ATTEMPTS       = 3      # Retry each chunk/symbol this many times
+RETRY_DELAY_SECONDS  = 10     # Wait between retries
 
 # ── Schedule Settings ─────────────────────────────────────────────────────────
 # Run daily at this time in 24-hour local time.

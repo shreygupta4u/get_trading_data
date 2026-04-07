@@ -1,3 +1,8 @@
 *.parquet
 trading_data.xlsx
 /__pycache__
+.symbol_state.json
+.symbol_state.json
+.symbol_state.json
+.claude/settings.local.json
+/data

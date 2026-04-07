@@ -8,7 +8,10 @@
       "Bash(pip show:*)",
       "Bash(pip install:*)",
       "Bash(python -c \"from pytickersymbols import PyTickerSymbols; pts = PyTickerSymbols\\(\\); stocks = list\\(pts.get_stocks_by_index\\(''S&P 500''\\)\\); print\\(f''S&P 500: {len\\(stocks\\)} stocks''\\); print\\(''Sample:'', stocks[0]\\)\")",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(python -c \"import pyspark; from delta import configure_spark_with_delta_pip; print\\(''pyspark'', pyspark.__version__\\)\")",
+      "Bash(python -c \"import deltalake; print\\(''''deltalake'''', deltalake.__version__\\)\")",
+      "Bash(dir \"C:\\\\Users\\\\mohin\\\\Documents\\\\PythonCodes\\\\get_trading_data\" /B)"
     ]
   }
 }

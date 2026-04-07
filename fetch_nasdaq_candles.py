@@ -37,7 +37,9 @@ import argparse
 import json
 import logging
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -49,6 +51,7 @@ from pytickersymbols import PyTickerSymbols
 
 import config
 import config_symbols
+import delta_utils
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -526,46 +529,45 @@ def fetch_symbol(symbol: str, start: date, end: date) -> pd.DataFrame:
     return _fetch_symbol_incremental(symbol, start, end)
 
 
-# ── Per-symbol Parquet storage ────────────────────────────────────────────────
+# ── Storage ───────────────────────────────────────────────────────────────────
 
-def symbol_parquet_path(symbol: str) -> Path:
-    return config.SYMBOLS_DATA_DIR / f"{symbol}.parquet"
-
-
-def save_symbol_data(df: pd.DataFrame, symbol: str) -> None:
+def _save_parquet_fallback(df: pd.DataFrame) -> None:
     """
-    Upsert new rows into the symbol's Parquet file.
-    Reads the existing file (if any), merges, de-duplicates on date, then writes.
+    Pandas-based fallback: write per-symbol Parquet files to data/symbols/.
+    Used when Java / Spark is not available.
     """
-    path = symbol_parquet_path(symbol)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    config.SYMBOLS_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    for symbol, group in df.groupby("symbol"):
+        path = config.SYMBOLS_DATA_DIR / f"{symbol}.parquet"
+        group = group.copy()
+        group["date"] = pd.to_datetime(group["date"])
 
-    df = df.copy()
-    df["date"] = pd.to_datetime(df["date"])
+        if path.exists():
+            existing = pd.read_parquet(path)
+            existing["date"] = pd.to_datetime(existing["date"])
+            group = pd.concat([existing, group], ignore_index=True)
 
-    if path.exists():
-        existing = pd.read_parquet(path)
-        existing["date"] = pd.to_datetime(existing["date"])
-        combined = pd.concat([existing, df], ignore_index=True)
-    else:
-        combined = df
+        group = (
+            group
+            .drop_duplicates(subset=["date"])
+            .sort_values("date")
+            .reset_index(drop=True)
+        )
+        group["symbol"] = group["symbol"].astype(str)
+        group.to_parquet(path, engine="pyarrow",
+                         compression=config.PARQUET_COMPRESSION, index=False)
+        log.info("  Parquet saved: %s — %d rows", path.name, len(group))
 
-    combined = (
-        combined
-        .drop_duplicates(subset=["date"])
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
-    combined["symbol"] = combined["symbol"].astype(str)
 
-    combined.to_parquet(
-        path,
-        engine="pyarrow",
-        compression=config.PARQUET_COMPRESSION,
-        index=False,
-    )
-    size_kb = path.stat().st_size / 1024
-    log.info("  Saved %s — %d rows total  (%.1f KB)", path.name, len(combined), size_kb)
+def save_symbol_data(df: pd.DataFrame, _symbol: str = "") -> None:
+    """
+    Persist candle rows to the Delta candles table (data/delta/candles/).
+
+    Uses the `deltalake` package — no Java required.
+    Per-symbol Parquet files in data/symbols/ are kept as a legacy backup
+    but are no longer the primary store.
+    """
+    delta_utils.upsert_candles(df)
 
 
 # ── Date helpers ──────────────────────────────────────────────────────────────
@@ -626,81 +628,109 @@ def run_all_symbols(
         log.error("Symbol list is empty — nothing to do.")
         return False
 
-    state = load_symbol_state()
-    any_success = False
-    total = len(symbols)
-    skipped = 0
-    failed = 0
+    # ── One-time migration of legacy Parquet files to Delta ──────────────────
+    delta_utils.migrate_parquet_to_delta()
 
-    log.info("Starting fetch for %d symbol(s)  end_date=%s", total, end)
-    log.info("State file: %s  (%d symbols already tracked)", config.SYMBOL_STATE_FILE, len(state))
+    state      = load_symbol_state()
+    state_lock = threading.Lock()
+    total      = len(symbols)
+    skipped    = 0
+    failed     = 0
+    any_success = False
+
+    log.info("Parallel fetch: %d symbol(s), %d workers, end=%s",
+             total, config.MAX_WORKERS, end)
+    log.info("State file: %s  (%d symbols already tracked)",
+             config.SYMBOL_STATE_FILE, len(state))
+
+    # ── Build the work list ───────────────────────────────────────────────────
+    pending: list[tuple[str, date]] = []
+    for symbol in symbols:
+        if override_start is not None:
+            pending.append((symbol, override_start))
+        elif force or symbol not in state:
+            pending.append((symbol, date(1900, 1, 1)))   # sentinel → period='max'
+        else:
+            last = date.fromisoformat(state[symbol])
+            nxt  = last + timedelta(days=1)
+            if nxt > end:
+                skipped += 1
+            else:
+                pending.append((symbol, nxt))
+
+    log.info("%d symbol(s) to fetch, %d already up to date", len(pending), skipped)
+
+    # ── Worker function (runs in each thread) ─────────────────────────────────
+    def _fetch_one(sym: str, start: date) -> tuple[str, pd.DataFrame | None, date | None]:
+        reason = "full history" if start <= _FULL_HISTORY_SENTINEL else f"{start} → {end}"
+        log.info("  [fetch] %s  (%s)", sym, reason)
+        try:
+            df = fetch_symbol(sym, start, end)
+            if df.empty:
+                return sym, None, None
+            latest = pd.to_datetime(df["date"]).dt.date.max()
+            return sym, df, latest
+        except Exception as exc:
+            log.error("  [error] %s: %s", sym, exc)
+            return sym, None, None
+
+    # ── Process in parallel batches of MAX_WORKERS ───────────────────────────
+    batch_size   = config.MAX_WORKERS
+    total_batches = max(1, (len(pending) + batch_size - 1) // batch_size)
 
     try:
-        for idx, symbol in enumerate(symbols, start=1):
+        for b_idx, b_start in enumerate(range(0, len(pending), batch_size), start=1):
+            batch = pending[b_start : b_start + batch_size]
+            pct   = (b_start / max(len(pending), 1)) * 100
 
-            # ── Checkpoint log every 50 symbols ──────────────────────────────
-            if idx > 1 and (idx - 1) % 50 == 0:
-                pct = (idx - 1) / total * 100
-                log.info(
-                    "=== Checkpoint: %d/%d (%.0f%%)  saved=%d  skipped=%d  failed=%d ===",
-                    idx - 1, total, pct, any_success and 1 or 0, skipped, failed,
+            log.info("=== Batch %d/%d  (%.0f%%)  symbols: %s ===",
+                     b_idx, total_batches, pct, [s for s, _ in batch])
+
+            # Fetch all symbols in this batch concurrently
+            with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
+                futures = {
+                    executor.submit(_fetch_one, sym, start): sym
+                    for sym, start in batch
+                }
+                batch_results: list[tuple[str, pd.DataFrame, date]] = []
+                for future in as_completed(futures):
+                    sym, df, latest = future.result()
+                    if df is not None:
+                        batch_results.append((sym, df, latest))
+                        log.info("  [done] %s  rows=%d  last=%s", sym, len(df), latest)
+                    else:
+                        failed += 1
+
+            # Write entire batch to Delta in one Spark operation
+            if batch_results:
+                combined = pd.concat(
+                    [r[1] for r in batch_results], ignore_index=True
                 )
+                save_symbol_data(combined)
 
-            log.info("--- [%d/%d] %s ---", idx, total, symbol)
+                # Update state for all symbols that succeeded
+                with state_lock:
+                    for sym, _, latest in batch_results:
+                        state[sym] = latest.isoformat()
+                    save_symbol_state(state)
 
-            # ── Determine start date for this symbol ──────────────────────────
-            if override_start is not None:
-                start = override_start
-                log.info("  Range override: %s to %s", start, end)
+                any_success = True
+                log.info("  Batch %d/%d saved: %d symbol(s), %d rows total",
+                         b_idx, total_batches, len(batch_results), len(combined))
 
-            elif force or symbol not in state:
-                start = date(1900, 1, 1)   # sentinel → period='max' fetch
-                reason = "forced re-fetch" if (force and symbol in state) else "new symbol"
-                log.info("  %s — fetching full history from IPO to %s", reason, end)
-
-            else:
-                last_fetched = date.fromisoformat(state[symbol])
-                start = last_fetched + timedelta(days=1)
-                if start > end:
-                    log.info("  Already up to date (last candle: %s) — skipping.", last_fetched)
-                    skipped += 1
-                    continue
-                log.info("  Incremental: %s to %s (last: %s)", start, end, last_fetched)
-
-            # ── Fetch ─────────────────────────────────────────────────────────
-            df = fetch_symbol(symbol, start, end)
-
-            if df.empty:
-                log.warning("  No data returned for %s — state unchanged.", symbol)
-                failed += 1
-                if idx < total:
-                    time.sleep(config.BATCH_DELAY_SECONDS)
-                continue
-
-            # ── Save & update state immediately after each symbol ─────────────
-            save_symbol_data(df, symbol)
-
-            latest_date = pd.to_datetime(df["date"]).dt.date.max()
-            state[symbol] = latest_date.isoformat()
-            save_symbol_state(state)          # written to disk after every symbol
-            any_success = True
-
-            log.info("  Saved: %s  last_candle=%s", symbol, latest_date)
-
-            if idx < total:
+            # Politeness pause between batches
+            if b_idx < total_batches:
                 time.sleep(config.BATCH_DELAY_SECONDS)
 
     except KeyboardInterrupt:
-        # State was already saved after the last completed symbol — nothing lost.
         log.warning(
-            "Interrupted by user after %d/%d symbols. "
-            "Re-run to continue from where it left off.",
-            idx, total,
+            "Interrupted — state already saved up to the last completed batch. "
+            "Re-run to continue."
         )
 
     done = sum(1 for s in symbols if s in state)
     log.info(
-        "Run complete: %d/%d symbols in state  |  skipped=%d  failed=%d",
+        "Run complete: %d/%d in state  |  skipped=%d  failed=%d",
         done, total, skipped, failed,
     )
     return any_success
