@@ -6,3 +6,6 @@ trading_data.xlsx
 .symbol_state.json
 .claude/settings.local.json
 /data
+.symbol_state.json
+*.pyc
+/logs
