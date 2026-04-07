@@ -12,3 +12,12 @@ trading_data.xlsx
 *.pyc
 *.pyc
 /__pycache__
+/__pycache__
+states/daily.json
+states/technicals_daily.json
+states/technicals_weekly.json
+states/weekly.json
+.symbol_state.json
+.symbol_state_technicals_daily.json
+.symbol_state_technicals_weekly.json
+.symbol_state_weekly.json

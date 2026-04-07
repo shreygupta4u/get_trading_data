@@ -13,7 +13,8 @@ DATA_DIR          = BASE_DIR / "data"                    # Root for all data
 SYMBOLS_DATA_DIR  = DATA_DIR / "symbols"                 # Legacy per-symbol parquet (kept, not deleted)
 DELTA_DIR         = DATA_DIR / "delta"                   # Delta Lake tables (primary store)
 LOG_DIR           = BASE_DIR / "logs"                    # Log files
-SYMBOL_STATE_FILE = BASE_DIR / ".symbol_state.json"      # Backward-compat alias (daily state)
+STATE_DIR         = BASE_DIR / "states"                  # Per-symbol incremental state files
+SYMBOL_STATE_FILE = STATE_DIR / ".symbol_state.json"     # Backward-compat alias (daily state)
 
 # ── Time Periods ──────────────────────────────────────────────────────────────
 # Periods processed by the orchestrator, in execution order.
@@ -29,10 +30,10 @@ TIME_PERIODS: list[str] = ["daily", "weekly"]
 #   technicals_daily   → candles-state date when daily indicators were last computed
 #   technicals_weekly  → candles-state date when weekly indicators were last computed
 SYMBOL_STATE_FILES: dict[str, Path] = {
-    "daily":             BASE_DIR / ".symbol_state.json",
-    "weekly":            BASE_DIR / ".symbol_state_weekly.json",
-    "technicals_daily":  BASE_DIR / ".symbol_state_technicals_daily.json",
-    "technicals_weekly": BASE_DIR / ".symbol_state_technicals_weekly.json",
+    "daily":             STATE_DIR / "daily.json",
+    "weekly":            STATE_DIR / "weekly.json",
+    "technicals_daily":  STATE_DIR / "technicals_daily.json",
+    "technicals_weekly": STATE_DIR / "technicals_weekly.json",
 }
 
 # ── Per-period Delta table paths ─────────────────────────────────────────────
@@ -61,13 +62,15 @@ NASDAQ_SYMBOLS_URL = (                                        # FTP fallback
 )
 
 # ── Fetch Settings ────────────────────────────────────────────────────────────
-BATCH_SIZE           = 100     # (legacy) symbols per yfinance batch call
-BATCH_DELAY_SECONDS  = 2      # Pause between parallel batches (politeness delay)
-MAX_WORKERS          = 4      # Parallel yfinance fetch threads per batch
-                               # Increase for faster downloads; lower if rate-limited
+MAX_WORKERS          = 20     # Concurrent yfinance fetch threads.
+                               # 20 is a good balance — fast without triggering
+                               # rate-limits. Lower to 10 if you see 429 errors.
+WRITE_BATCH_SIZE     = 50     # Flush completed symbols to Delta every N results.
+                               # Larger = fewer Delta writes (faster overall).
+                               # Smaller = more frequent state saves (safer on crash).
 REQUEST_TIMEOUT      = 30     # yfinance download timeout in seconds
 RETRY_ATTEMPTS       = 3      # Retry each chunk/symbol this many times
-RETRY_DELAY_SECONDS  = 10     # Wait between retries
+RETRY_DELAY_SECONDS  = 5      # Wait between retries (reduced from 10)
 
 # ── Schedule Settings ─────────────────────────────────────────────────────────
 # Run daily at this time in 24-hour local time.

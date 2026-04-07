@@ -380,6 +380,7 @@ def load_symbol_state(period: str = "daily") -> dict[str, str]:
 def save_symbol_state(state: dict[str, str], period: str = "daily") -> None:
     """Persist the state dict to disk (sorted for readability)."""
     path = config.SYMBOL_STATE_FILES.get(period, config.SYMBOL_STATE_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)   # ensure states/ exists
     path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
 
@@ -750,64 +751,88 @@ def _run_all_daily(
             else:
                 pending.append((symbol, nxt))
 
-    log.info("[daily] %d to fetch, %d already up to date", len(pending), skipped)
+    n_pending = len(pending)
+    log.info("[daily] %d to fetch, %d already up to date | workers=%d write_every=%d",
+             n_pending, skipped, config.MAX_WORKERS, config.WRITE_BATCH_SIZE)
 
+    if not pending:
+        return True
+
+    # ── Worker: fetch + compute indicators for one symbol ────────────────────
     def _fetch_one(sym: str, start: date) -> tuple[str, pd.DataFrame | None, date | None]:
         reason = "full history" if start <= _FULL_HISTORY_SENTINEL else f"{start} to {end}"
-        log.info("  [daily] %s  (%s)", sym, reason)
         try:
             df = fetch_symbol(sym, start, end)
             if df.empty:
                 return sym, None, None
-            # Compute indicators inline — uses full history from Delta for context
-            df = _add_indicators(df)
+            df     = _add_indicators(df)
             latest = pd.to_datetime(df["date"]).dt.date.max()
+            log.info("  [done] %-8s  rows=%-5d  last=%s", sym, len(df), latest)
             return sym, df, latest
         except Exception as exc:
-            log.error("  [daily error] %s: %s", sym, exc)
+            log.error("  [fail] %s: %s", sym, exc)
             return sym, None, None
 
-    batch_size    = config.MAX_WORKERS
-    total_batches = max(1, (len(pending) + batch_size - 1) // batch_size)
+    # ── Helper: flush write buffer to Delta + update state ───────────────────
+    def _flush(buf: list) -> None:
+        nonlocal any_success
+        if not buf:
+            return
+        combined = pd.concat([r[1] for r in buf], ignore_index=True)
+        save_symbol_data(combined, period="daily")
+        with state_lock:
+            for sym, _, latest in buf:
+                state[sym] = latest.isoformat()
+            save_symbol_state(state, "daily")
+        any_success = True
+        log.info("  [write] %d symbol(s) flushed to Delta (%d rows) | "
+                 "total done: %d/%d",
+                 len(buf), len(combined),
+                 sum(1 for s in symbols if s in state), total)
+
+    # ── Single executor — all symbols submitted at once ───────────────────────
+    # as_completed() yields each future the moment it finishes, so fast symbols
+    # never wait for slow ones.  Results are buffered and flushed to Delta every
+    # WRITE_BATCH_SIZE completions so the state file is updated frequently.
+    write_buf: list[tuple[str, pd.DataFrame, date]] = []
+    completed = 0
 
     try:
-        for b_idx, b_start in enumerate(range(0, len(pending), batch_size), start=1):
-            batch = pending[b_start : b_start + batch_size]
-            pct   = (b_start / max(len(pending), 1)) * 100
-            log.info("=== [daily] Batch %d/%d  (%.0f%%)  %s ===",
-                     b_idx, total_batches, pct, [s for s, _ in batch])
+        with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch_one, sym, start): sym
+                       for sym, start in pending}
 
-            with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
-                futures = {executor.submit(_fetch_one, sym, start): sym
-                           for sym, start in batch}
-                batch_results: list[tuple[str, pd.DataFrame, date]] = []
-                for future in as_completed(futures):
-                    sym, df, latest = future.result()
-                    if df is not None:
-                        batch_results.append((sym, df, latest))
-                        log.info("  [daily done] %s  rows=%d  last=%s", sym, len(df), latest)
-                    else:
-                        failed += 1
+            for future in as_completed(futures):
+                sym, df, latest = future.result()
+                completed += 1
 
-            if batch_results:
-                combined = pd.concat([r[1] for r in batch_results], ignore_index=True)
-                save_symbol_data(combined, period="daily")
-                with state_lock:
-                    for sym, _, latest in batch_results:
-                        state[sym] = latest.isoformat()
-                    save_symbol_state(state, "daily")
-                any_success = True
-                log.info("  [daily] Batch %d/%d saved: %d symbol(s), %d rows",
-                         b_idx, total_batches, len(batch_results), len(combined))
+                if df is not None:
+                    write_buf.append((sym, df, latest))
+                else:
+                    failed += 1
 
-            if b_idx < total_batches:
-                time.sleep(config.BATCH_DELAY_SECONDS)
+                # Progress log every 50 completions (regardless of success)
+                if completed % 50 == 0 or completed == n_pending:
+                    pct = completed / n_pending * 100
+                    log.info("[daily] Progress: %d/%d (%.0f%%) | "
+                             "queued=%d failed=%d",
+                             completed, n_pending, pct, len(write_buf), failed)
+
+                # Flush to Delta every WRITE_BATCH_SIZE successful symbols
+                if len(write_buf) >= config.WRITE_BATCH_SIZE:
+                    _flush(write_buf)
+                    write_buf = []
+
+        # Final flush for any remaining results
+        _flush(write_buf)
 
     except KeyboardInterrupt:
-        log.warning("[daily] Interrupted — state saved to last completed batch.")
+        log.warning("[daily] Interrupted — flushing %d buffered results...", len(write_buf))
+        _flush(write_buf)
+        log.warning("[daily] State saved. Re-run to continue from where it stopped.")
 
     done = sum(1 for s in symbols if s in state)
-    log.info("[daily] Done: %d/%d in state | skipped=%d failed=%d",
+    log.info("[daily] Complete: %d/%d in state | skipped=%d failed=%d",
              done, total, skipped, failed)
     return any_success
 
